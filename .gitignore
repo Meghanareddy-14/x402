@@ -1,9 +1,0 @@
-x402-demo-server/.env
-x402-demo-server/.env.meme-generator
-x402-demo-server/node_modules
-402-demo-client/node_modules
-402-demo-client/klh/node_modules
-.env
-*.env
-node_modules
-dist
