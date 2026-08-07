@@ -1,109 +1,90 @@
-/**
- * X402 Hackathon Starter Kit - Main Server
- *
- * This server demonstrates how to build payment-protected API endpoints
- * using the x402 protocol on Algorand TestNet.
- *
- * TEAM QUICK START:
- * 1. Import handlers from ./handlers/ directory
- * 2. Enable endpoints in endpoints.config.ts
- * 3. Register routes below
- * 4. Start server: npm start
- * 5. Test: curl http://localhost:4021/your-endpoint
- */
-
 import { config } from 'dotenv';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
-import { paymentMiddleware } from '@x402/hono';
-import { x402ResourceServer, HTTPFacilitatorClient } from '@x402/core/server';
-import type { ResourceServerExtension } from '@x402/core/types';
+import { paymentMiddleware, x402ResourceServer } from '@x402/hono';
+import { HTTPFacilitatorClient } from '@x402/core/server';
+import type { Network } from '@x402/core/types';
 import { ExactAvmScheme } from '@x402/avm/exact/server';
-import { ALGORAND_TESTNET_CAIP2 } from '@x402/avm';
-import { bazaarResourceServerExtension } from '@x402-avm/extensions';
+import { USDC_TESTNET_ASA_ID } from '@x402/avm';
+import { handleAIAnalysisRequest } from './handlers/ai-analysis.js';
+import { handleCheckPayment } from './handlers/check-payment.js';
 
-// Import handler functions
-import { handleWeatherRequest } from './handlers/weather';
-import { handleAnalyticsRequest, handleAnalyticsReportRequest } from './handlers/analytics';
-import {
-  handleAIAnalysisRequest,
-  handleAIAnalysisBatchRequest,
-} from './handlers/ai-analysis';
-import {
-  handleCreatorContentRequest,
-  handleCreatorContentListRequest,
-  handleCreatorPublishRequest,
-  handleCreatorEarningsRequest,
-} from './handlers/creator-content';
-import { handleMemeGenerateRequest, handleMemeStylesRequest } from './handlers/meme-generator';
+// Full Algorand TestNet CAIP-2 as used by GoPlausible facilitator
+// @x402/avm exports a truncated constant, so we define the full value here
+const AVM_NETWORK = 'algorand:SGO1GKSzyE7IEPItTxCByw9x8FmnrCDexi9/cOUJOiI=' as Network;
 
-// Import endpoint configuration
-import createPaymentConfig, { EndpointConfig } from './endpoints.config';
-
-// Load environment variables
 config();
 
-// ════════════════════════════════════════════════════════════════════
-// CONFIGURATION & SETUP
-// ════════════════════════════════════════════════════════════════════
+// ─── Environment Validation ─────────────────────────────────────────────────
 
 const avmAddress = process.env.AVM_ADDRESS;
 const facilitatorUrl = process.env.FACILITATOR_URL;
-const port = parseInt(process.env.PORT || '4021', 10);
+const port = parseInt(process.env.PORT ?? '4021', 10);
 
-// Validate required environment
-if (!avmAddress || !facilitatorUrl) {
-  console.error(
-    '❌ Missing required environment variables:\n' +
-    '   - AVM_ADDRESS (your Algorand wallet receiving payments)\n' +
-    '   - FACILITATOR_URL (x402 facilitator service)'
-  );
+if (!avmAddress) {
+  console.error('[Server] FATAL: AVM_ADDRESS environment variable is required');
+  process.exit(1);
+}
+if (!facilitatorUrl) {
+  console.error('[Server] FATAL: FACILITATOR_URL environment variable is required');
   process.exit(1);
 }
 
-console.log('\n' + '═'.repeat(60));
-console.log('x402 HACKATHON STARTER KIT');
-console.log('═'.repeat(60));
-console.log('Configuration:');
-console.log(`  Receiver Address: ${avmAddress}`);
-console.log(`  Facilitator: ${facilitatorUrl}`);
-console.log(`  Port: ${port}`);
-console.log('═'.repeat(60) + '\n');
+console.log('[Server] Configuration:');
+console.log(`  AVM_ADDRESS     : ${avmAddress}`);
+console.log(`  FACILITATOR_URL : ${facilitatorUrl}`);
+console.log(`  PORT            : ${port}`);
+console.log(`  OPENAI_API_KEY  : ${process.env.OPENAI_API_KEY ? '[SET]' : '[NOT SET - REQUIRED]'}`);
 
-// Initialize x402 Resource Server
+// ─── x402 Resource Server Setup ─────────────────────────────────────────────
+
 const facilitatorClient = new HTTPFacilitatorClient({ url: facilitatorUrl });
-const x402Server = new x402ResourceServer(facilitatorClient)
-  .register(ALGORAND_TESTNET_CAIP2, new ExactAvmScheme())
-  .registerExtension(bazaarResourceServerExtension as unknown as ResourceServerExtension);
+const server = new x402ResourceServer(facilitatorClient);
 
-// Create Hono app
+const avmServerScheme = new ExactAvmScheme();
+server.register(AVM_NETWORK, avmServerScheme);
+
+console.log('[Server] x402 resource server initialized');
+console.log(`[Server] Registered network: ${AVM_NETWORK}`);
+
+// ─── Payment Middleware Config ───────────────────────────────────────────────
+
+const paymentConfig = {
+  'POST /ai-analysis': {
+    accepts: [
+      {
+        scheme: 'exact' as const,
+        price: '$0.01',
+        network: AVM_NETWORK,
+        payTo: avmAddress,
+        extra: { asset: USDC_TESTNET_ASA_ID },
+      },
+    ],
+    description: 'AI-powered cybersecurity risk analysis of text content',
+    mimeType: 'application/json',
+  },
+};
+
+// ─── Hono App ────────────────────────────────────────────────────────────────
+
 const app = new Hono();
 
-// ════════════════════════════════════════════════════════════════════
-// MIDDLEWARE STACK
-// ════════════════════════════════════════════════════════════════════
-
-/**
- * CORS Middleware - MUST be first!
- *
- * Handles browser preflight requests and exposes payment headers
- * x402 requires wildcard CORS to expose Payment-Signature headers
- */
+// 1. CORS — MUST be first, before everything else
 app.use('*', async (c, next) => {
-  const corsHeaders = {
+  const corsHeaders: Record<string, string> = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE, HEAD',
-    'Access-Control-Allow-Headers': '*', // Critical for x402
-    'Access-Control-Expose-Headers': '*', // Critical for x402
+    'Access-Control-Allow-Headers': '*',
+    'Access-Control-Expose-Headers': '*',
     'Access-Control-Max-Age': '86400',
   };
 
-  // Handle OPTIONS preflight
+  // Handle browser preflight immediately
   if (c.req.method === 'OPTIONS') {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
 
-  // Add headers to response
+  // Attach CORS headers to all responses
   Object.entries(corsHeaders).forEach(([key, value]) => {
     c.header(key, value);
   });
@@ -111,145 +92,102 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-/**
- * Logging Middleware
- *
- * Logs all requests for debugging and monitoring
- */
+// 2. Request logging
 app.use('*', async (c, next) => {
-  const timestamp = new Date().toISOString();
-  console.log(`\n[${timestamp}] ${c.req.method.toUpperCase()} ${c.req.path}`);
-
-  // Log headers (useful for debugging)
-  if (c.req.header('payment-signature')) {
-    console.log('  ✓ Payment-Signature header detected');
-  }
-
+  const start = Date.now();
+  console.log(`[${new Date().toISOString()}] ${c.req.method} ${c.req.path}`);
   await next();
-  console.log(`  Response: ${c.res.status}`);
+  const ms = Date.now() - start;
+  console.log(`[${new Date().toISOString()}] ${c.req.method} ${c.req.path} → ${c.res.status} (${ms}ms)`);
 });
 
-/**
- * X402 Payment Middleware
- *
- * Applies payment protection to configured endpoints
- * Intercepts requests and enforces x402 protocol
- */
-const paymentConfig: EndpointConfig = createPaymentConfig(avmAddress);
-console.log('📋 Registered Payment-Protected Endpoints:');
-Object.entries(paymentConfig).forEach(([route, config]) => {
-  const price = config.accepts[0]?.price || 'unknown';
-  console.log(`   ${route} - ${price} USDC - ${config.description}`);
-});
-console.log();
+// ─── Public Routes ───────────────────────────────────────────────────────────
 
-app.use(paymentMiddleware(paymentConfig as any, x402Server));
-
-// ════════════════════════════════════════════════════════════════════
-// ROUTE HANDLERS - Payment-Protected Endpoints
-// ════════════════════════════════════════════════════════════════════
-
-/**
- * These handlers are only called AFTER payment is verified
- * by the x402 middleware
- */
-
-// Example 1: Weather Data - Pay $0.005
-app.get('/weather', handleWeatherRequest);
-
-// Meme Generator - Pay $0.1 USDC (Payment Protected)
-app.post('/meme-generate', handleMemeGenerateRequest);
-
-
-// Example 2: Analytics - Uncomment to enable
-// app.get('/analytics', handleAnalyticsRequest);
-// app.post('/analytics/report', handleAnalyticsReportRequest);
-
-// Example 3: AI Analysis - Uncomment to enable
-// app.post('/ai-analysis', handleAIAnalysisRequest);
-// app.post('/ai-analysis/batch', handleAIAnalysisBatchRequest);
-
-// Example 4: Creator Content - Uncomment to enable
-// app.get('/exclusive-content/:id', handleCreatorContentRequest);
-// app.get('/creators/:wallet/content', handleCreatorContentListRequest);
-// app.post('/creators/publish', handleCreatorPublishRequest);
-// app.get('/creators/:wallet/earnings', handleCreatorEarningsRequest);
-
-// ════════════════════════════════════════════════════════════════════
-// PUBLIC ENDPOINTS - No payment required
-// ════════════════════════════════════════════════════════════════════
-
-/**
- * Health check - Use this to verify server is running
- * No payment required
- */
-app.get('/health', (c) => {
+app.get('/health', c => {
   return c.json({
     status: 'ok',
-    service: 'x402-hackathon-starter',
-    uptime: process.uptime(),
-  });
-});
-
-/**
- * Info endpoint - Shows configured endpoints
- * Helpful for debugging and integration
- */
-app.get('/info', (c) => {
-  return c.json({
-    service: 'x402-hackathon-starter',
+    service: 'RiskGuard AI — x402 Risk Analysis Server',
+    timestamp: new Date().toISOString(),
     version: '1.0.0',
-    network: 'Algorand TestNet',
-    receiver: avmAddress,
-    endpoints: Object.keys(paymentConfig),
-    documentation: 'See README.md in project root',
   });
 });
 
-/**
- * Meme Styles endpoint - Shows available styles and themes
- * Public endpoint - no payment required
- */
-app.get('/meme-styles', handleMemeStylesRequest);
-
-// ════════════════════════════════════════════════════════════════════
-// ERROR HANDLING
-// ════════════════════════════════════════════════════════════════════
-
-/**
- * 404 Handler
- *
- * Called when no route matches
- */
-app.notFound((c) => {
-  return c.json(
-    {
-      error: 'Endpoint not found',
-      path: c.req.path,
-      hint: 'Try GET /health or GET /info for diagnostics',
+app.get('/info', c => {
+  return c.json({
+    service: 'RiskGuard AI',
+    description: 'AI-powered cybersecurity risk analysis with x402 pay-per-use payments',
+    version: '1.0.0',
+    endpoints: {
+      'GET /health': { public: true, description: 'Health check' },
+      'GET /info': { public: true, description: 'Service information' },
+      'POST /ai-analysis': {
+        public: false,
+        payment_required: true,
+        price: '$0.01 USDC',
+        network: 'Algorand TestNet',
+        description: 'Analyze text content for cybersecurity risks using AI',
+      },
+      'POST /check-payment': {
+        public: true,
+        description: 'Check if on-chain USDC payment arrived; if yes, run AI analysis automatically',
+      },
+      'POST /analyze-direct': {
+        public: true,
+        description: 'Run AI analysis directly without payment gate (used after manual payment confirmation)',
+      },
     },
-    404
-  );
+    payment: {
+      facilitator: facilitatorUrl,
+      receiver: avmAddress,
+      network: AVM_NETWORK,
+      asset: USDC_TESTNET_ASA_ID,
+    },
+    timestamp: new Date().toISOString(),
+  });
 });
 
-// ════════════════════════════════════════════════════════════════════
-// SERVER STARTUP
-// ════════════════════════════════════════════════════════════════════
+// Public payment-check endpoint — polls Algorand indexer directly, no payment-signature needed
+app.post('/check-payment', handleCheckPayment);
+
+// Direct analysis endpoint — runs OpenAI without payment gate
+// Used when user manually confirms payment via "I Have Paid" button
+app.post('/analyze-direct', handleAIAnalysisRequest);
+
+// ─── Payment Middleware (only protects configured routes) ───────────────────
+
+// syncFacilitatorOnStart defaults to true — will call facilitator /supported on startup
+app.use(paymentMiddleware(paymentConfig, server));
+
+// ─── Protected Routes ────────────────────────────────────────────────────────
+
+app.post('/ai-analysis', handleAIAnalysisRequest);
+
+// ─── 404 Handler ────────────────────────────────────────────────────────────
+
+app.notFound(c => {
+  return c.json({ error: `Not found: ${c.req.method} ${c.req.path}` }, 404);
+});
+
+// ─── Error Handler ───────────────────────────────────────────────────────────
+
+app.onError((err, c) => {
+  console.error('[Server] Unhandled error:', err);
+  return c.json({ error: 'Internal server error' }, 500);
+});
+
+// ─── Start Server ────────────────────────────────────────────────────────────
 
 serve({ fetch: app.fetch, port }, () => {
-  console.log('\n✅ x402 Resource Server is running!\n');
-  console.log('═'.repeat(60));
-  console.log('Endpoints:');
-  console.log(`  API:     http://localhost:${port}`);
-  console.log(`  Health:  http://localhost:${port}/health`);
-  console.log(`  Info:    http://localhost:${port}/info`);
-  console.log('═'.repeat(60));
-  console.log('\n📚 QUICK COMMANDS:\n');
-  console.log('Test health endpoint (no payment):');
-  console.log(`  curl http://localhost:${port}/health\n`);
-  console.log('Test payment endpoint (will request payment):');
-  console.log(`  curl http://localhost:${port}/weather\n`);
-  console.log('See handlers/ directory for examples');
-  console.log('See endpoints.config.ts to add new endpoints');
-  console.log('\n' + '═'.repeat(60) + '\n');
+  console.log('');
+  console.log('╔══════════════════════════════════════════════════════╗');
+  console.log('║          RiskGuard AI — x402 Resource Server         ║');
+  console.log('╠══════════════════════════════════════════════════════╣');
+  console.log(`║  Listening on: http://localhost:${port}                  ║`);
+  console.log('║  Public:  GET  /health                               ║');
+  console.log('║  Public:  GET  /info                                 ║');
+  console.log('║  Public:  POST /check-payment  (blockchain poll)     ║');
+  console.log('║  Paid:    POST /ai-analysis    ($0.01 USDC)          ║');
+  console.log('║  Network: Algorand TestNet                           ║');
+  console.log('╚══════════════════════════════════════════════════════╝');
+  console.log('');
 });
