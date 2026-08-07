@@ -1,0 +1,20 @@
+/* Reset Vite starter defaults — App.css handles all styling */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: #0d1117;
+  color: #e6edf3;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
