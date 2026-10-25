@@ -1,5 +1,5 @@
 import type { Context } from 'hono';
-import OpenAI from 'openai';
+import Groq from 'groq-sdk';
 
 export const MAX_CONTENT_LENGTH = 5000;
 
@@ -174,13 +174,13 @@ export async function handleAIAnalysisRequest(c: Context): Promise<Response> {
     );
   }
 
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey || openaiKey === 'your_openai_api_key_here') {
-    console.error('[AI Analysis] OPENAI_API_KEY is not configured');
-    return c.json({ error: 'AI analysis service is not configured. Please set OPENAI_API_KEY.' }, 503);
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) {
+    console.error('[AI Analysis] GROQ_API_KEY is not configured');
+    return c.json({ error: 'AI analysis service is not configured. Please set GROQ_API_KEY.' }, 503);
   }
 
-  const openai = new OpenAI({ apiKey: openaiKey });
+  const groq = new Groq({ apiKey: groqKey });
 
   let analysis: RiskAnalysis;
   let modelUsed: string;
@@ -189,8 +189,8 @@ export async function handleAIAnalysisRequest(c: Context): Promise<Response> {
   try {
     console.log(`[AI Analysis] Analyzing content (${trimmed.length} chars)...`);
 
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+    const completion = await groq.chat.completions.create({
+      model: 'qwen/qwen3.8-27b',
       messages: [
         { role: 'system', content: RISK_ANALYSIS_SYSTEM_PROMPT },
         {
@@ -221,18 +221,11 @@ export async function handleAIAnalysisRequest(c: Context): Promise<Response> {
     analysis = parseAIResponse(rawContent);
     console.log(`[AI Analysis] Analysis complete. Risk level: ${analysis.risk_level} (${analysis.risk_score}/100)`);
   } catch (err) {
-    if (err instanceof OpenAI.APIError) {
-      console.error(`[AI Analysis] OpenAI API error: ${err.status} ${err.message}`);
-
-      if (err.status === 401) {
-        return c.json({ error: 'AI service authentication failed. Please check OPENAI_API_KEY.' }, 503);
-      }
-      if (err.status === 429) {
-        return c.json({ error: 'AI service rate limit reached. Please try again shortly.' }, 503);
-      }
-      if (err.status === 500 || err.status === 503) {
-        return c.json({ error: 'AI service temporarily unavailable. Please try again later.' }, 503);
-      }
+    if (err instanceof Groq.APIError) {
+      console.error(`[AI Analysis] Groq API error: ${err.status} ${err.message}`);
+      if (err.status === 401) return c.json({ error: 'AI service authentication failed. Check GROQ_API_KEY.' }, 503);
+      if (err.status === 429) return c.json({ error: 'AI service rate limit reached. Please try again shortly.' }, 503);
+      if (err.status === 500 || err.status === 503) return c.json({ error: 'AI service temporarily unavailable.' }, 503);
       return c.json({ error: `AI service error: ${err.message}` }, 503);
     }
 

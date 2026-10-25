@@ -34,7 +34,7 @@ console.log('[Server] Configuration:');
 console.log(`  AVM_ADDRESS     : ${avmAddress}`);
 console.log(`  FACILITATOR_URL : ${facilitatorUrl}`);
 console.log(`  PORT            : ${port}`);
-console.log(`  OPENAI_API_KEY  : ${process.env.OPENAI_API_KEY ? '[SET]' : '[NOT SET - REQUIRED]'}`);
+console.log(`  GROQ_API_KEY    : ${process.env.GROQ_API_KEY ? '[SET]' : '[NOT SET - REQUIRED]'}`);
 
 // ─── x402 Resource Server Setup ─────────────────────────────────────────────
 
@@ -129,11 +129,7 @@ app.get('/info', c => {
       },
       'POST /check-payment': {
         public: true,
-        description: 'Check if on-chain USDC payment arrived; if yes, run AI analysis automatically',
-      },
-      'POST /analyze-direct': {
-        public: true,
-        description: 'Run AI analysis directly without payment gate (used after manual payment confirmation)',
+        description: 'Poll Algorand indexer for on-chain payment; runs AI only after payment confirmed',
       },
     },
     payment: {
@@ -146,12 +142,9 @@ app.get('/info', c => {
   });
 });
 
-// Public payment-check endpoint — polls Algorand indexer directly, no payment-signature needed
+// Public payment-check endpoint — polls Algorand indexer for real on-chain USDC payment
+// Only returns AI results AFTER payment is confirmed on the blockchain
 app.post('/check-payment', handleCheckPayment);
-
-// Direct analysis endpoint — runs OpenAI without payment gate
-// Used when user manually confirms payment via "I Have Paid" button
-app.post('/analyze-direct', handleAIAnalysisRequest);
 
 // ─── Payment Middleware (only protects configured routes) ───────────────────
 

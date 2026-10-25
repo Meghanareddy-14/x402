@@ -96,7 +96,9 @@ function CopyBtn({ text }) {
 }
 
 // ─── Payment Modal ────────────────────────────────────────────────────────────
-function PaymentModal({ req, qr, qrErr, phase, pollNum, modalError, onClose, onRetry, onCheckNow }) {
+// onCheckNow is intentionally removed — no manual payment confirmation button.
+// Payment verification is automatic only, based on Algorand blockchain polling.
+function PaymentModal({ req, qr, qrErr, phase, pollNum, modalError, onClose, onRetry }) {
   const amount   = fmtAmount(req);
   const receiver = getReceiver(req);
   const short    = receiver ? `${receiver.slice(0,8)}...${receiver.slice(-8)}` : '';
@@ -143,46 +145,52 @@ function PaymentModal({ req, qr, qrErr, phase, pollNum, modalError, onClose, onR
           </div>
         </div>
 
-        {/* Status strip */}
+        {/* Status strip — automatic detection only, no manual button */}
         <div className="auto-detect-strip">
           {phase === 'success' ? (
             <div className="auto-detect-success">✅ Payment verified — loading results…</div>
           ) : phase === 'analyzing' ? (
             <div className="auto-detect-checking">
               <span className="spinner-inline" />
-              Running AI analysis — please wait…
+              🤖 AI analyzing risk — please wait…
             </div>
           ) : phase === 'verifying' ? (
             <div className="auto-detect-checking">
               <span className="spinner-inline" />
-              Checking blockchain{pollNum > 0 ? ` (check #${pollNum})` : ''}…
+              🔍 Checking Algorand blockchain{pollNum > 0 ? ` (check #${pollNum})` : ''}…
             </div>
           ) : phase === 'waiting' ? (
             <div className="auto-detect-waiting">
               <span className="pulse-dot" />
-              Auto-detecting payment{pollNum > 0 ? ` · check #${pollNum}` : ''} · every {POLL_INTERVAL_MS/1000}s
+              ⏳ Waiting for USDC payment{pollNum > 0 ? ` · check #${pollNum}` : ''} · auto-checking every {POLL_INTERVAL_MS/1000}s
             </div>
           ) : phase === 'error' ? (
             <div className="auto-detect-error">
-              <div>❌ {modalError || 'Analysis failed. Check that OPENAI_API_KEY is set in the backend .env file.'}</div>
+              ❌ {modalError || 'Payment not detected. Please complete the USDC payment and try again.'}
             </div>
-          ) : null}
+          ) : (
+            <div className="auto-detect-waiting">
+              <span className="pulse-dot" />
+              ⏳ Waiting for USDC payment on Algorand TestNet…
+            </div>
+          )}
         </div>
 
+        {/* Actions — no manual "I have paid" button */}
         <div className="modal-actions">
           {phase === 'error' ? (
-            <><button className="btn btn-primary" onClick={onRetry}>Try Again</button>
+            /* Error: only allow full restart (new startedAt) or cancel */
+            <><button className="btn btn-primary" onClick={onRetry}>Restart Payment</button>
               <button className="btn btn-ghost"  onClick={onClose}>Cancel</button></>
-          ) : phase === 'analyzing' || phase === 'verifying' || phase === 'success' ? (
-            <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
           ) : (
-            <><button className="btn btn-primary" onClick={onCheckNow}>✓ I Have Paid — Check Now</button>
-              <button className="btn btn-ghost"  onClick={onClose}>Cancel</button></>
+            /* Waiting/verifying/analyzing: only allow cancel */
+            <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
           )}
         </div>
 
         <p className="modal-footer-note">
-          Payment auto-detected every {POLL_INTERVAL_MS/1000}s. Results appear immediately after confirmation.
+          Payment is detected automatically from the Algorand blockchain every {POLL_INTERVAL_MS/1000}s.
+          Complete your USDC payment and results will appear automatically.
         </p>
       </div>
     </div>
@@ -286,11 +294,12 @@ export default function App() {
   const [results, setResults] = useState(null);
 
   // ── Refs for polling (never stale) ──
-  const stopRef      = useRef(false);   // set true to kill the poll loop
-  const timerRef     = useRef(null);
-  const contentRef   = useRef('');
-  const startedAtRef = useRef(0);
-  const amountRef    = useRef(10000);
+  const stopRef        = useRef(false);   // set true to kill the poll loop
+  const timerRef       = useRef(null);
+  const contentRef     = useRef('');
+  const startedAtRef   = useRef(0);
+  const amountRef      = useRef(10000);
+  const sessionIdRef   = useRef(0);       // incremented per Analyze click — prevents old sessions
 
   // sync content ref
   useEffect(() => { contentRef.current = content; }, [content]);
@@ -311,6 +320,7 @@ export default function App() {
 
     if (attemptNum >= MAX_POLLS) {
       setPhase('error');
+      setModalError('Payment not detected after 5 minutes. Please complete the USDC payment and try again, or click "Restart Payment".');
       stopRef.current = true;
       return;
     }
@@ -318,10 +328,10 @@ export default function App() {
     setPollNum(attemptNum + 1);
     setPhase('verifying');
 
-    // Every 10 attempts, push the lookback window back by another minute
-    // so we don't miss a payment that happened just before we started watching
-    const extraMs = Math.floor(attemptNum / 10) * 60_000;
-    const lookbackStart = startedAtRef.current - extraMs;
+    // Use the session's exact startedAt — never drift backwards to avoid
+    // picking up transactions from previous sessions
+    const lookbackStart = startedAtRef.current;
+    const mySession = sessionIdRef.current;
 
     try {
       const resp = await fetch(`${API_URL}/check-payment`, {
@@ -334,74 +344,46 @@ export default function App() {
         }),
       });
 
-      if (stopRef.current) return;
+      // If a new session started while we were awaiting, discard this result
+      if (stopRef.current || sessionIdRef.current !== mySession) return;
 
-      if (!resp.ok) {
-        // server error — keep polling
+      if (!resp.ok && resp.status !== 502) {
+        // server error — keep polling (don't stop on transient errors)
         setPhase('waiting');
         timerRef.current = setTimeout(() => checkOnce(attemptNum + 1), POLL_INTERVAL_MS);
         return;
       }
 
       const data = await resp.json();
-      if (stopRef.current) return;
-
-      console.log('[Poll] /check-payment response:', JSON.stringify(data).slice(0, 200));
+      if (stopRef.current || sessionIdRef.current !== mySession) return;
 
       if (data.paid === true) {
-        // ── Payment confirmed — stop everything immediately ──
+        // ── Payment confirmed on-chain ──
         stopPolling();
 
         if (data.results) {
-          // Close modal and show results in one synchronous batch
+          // ✅ Payment verified + AI analysis complete
+          console.log(`[PAYMENT] Payment verified ✓ txID=${data.transaction_id} — showing results`);
           setModalOpen(false);
           setPhase('idle');
-          setResults(data.results);   // ← this triggers {results ? <RiskResults> : ...}
+          setResults(data.results);
         } else {
-          // Rare: paid=true but no results yet — show analyzing state and retry once
-          setPhase('analyzing');
-          await runAIDirectly();
+          // Payment confirmed but AI failed (502)
+          setModalError(data.error || 'Payment verified, but AI analysis failed. Click "Restart Payment" to try again.');
+          setPhase('error');
         }
         return;
       }
 
-      // Not yet paid
+      // Not yet paid — schedule next poll
       setPhase('waiting');
       timerRef.current = setTimeout(() => checkOnce(attemptNum + 1), POLL_INTERVAL_MS);
 
     } catch (err) {
-      if (stopRef.current) return;
+      if (stopRef.current || sessionIdRef.current !== mySession) return;
       console.warn('[Poll] error:', err.message);
       setPhase('waiting');
       timerRef.current = setTimeout(() => checkOnce(attemptNum + 1), POLL_INTERVAL_MS);
-    }
-  }
-
-  // ── Fallback: paid=true but results missing — call check-payment once more ──
-  async function runAIDirectly() {
-    try {
-      const resp = await fetch(`${API_URL}/check-payment`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content:   contentRef.current,
-          startedAt: startedAtRef.current,
-          amount:    amountRef.current,
-        }),
-      });
-      if (stopRef.current) return;
-      if (!resp.ok) { setPhase('error'); return; }
-      const data = await resp.json();
-      if (stopRef.current) return;
-      if (data.results) {
-        setModalOpen(false);
-        setPhase('idle');
-        setResults(data.results);
-      } else {
-        setPhase('error');
-      }
-    } catch {
-      if (!stopRef.current) setPhase('error');
     }
   }
 
@@ -424,6 +406,10 @@ export default function App() {
     setResults(null);
     setBusy(true);
 
+    // New session — invalidate any previous poll state
+    stopPolling();
+    sessionIdRef.current += 1;
+
     try {
       const resp = await fetch(`${API_URL}/ai-analysis`, {
         method: 'POST',
@@ -438,7 +424,8 @@ export default function App() {
         const decoded = decodePaymentRequired(hdr);
         const rawAmt  = decoded?.accepts?.[0]?.amount;
 
-        // Record session metadata for polling
+        // Record this session's start time — polling will ONLY look for
+        // transactions that occurred after this moment
         startedAtRef.current = Date.now();
         amountRef.current    = rawAmt ? Number(rawAmt) : 10000;
 
@@ -447,6 +434,7 @@ export default function App() {
         setPhase('idle');
         setQrData(null);
         setQrErr('');
+        setModalError('');
         setBusy(false);
 
         // Generate QR
@@ -455,7 +443,7 @@ export default function App() {
           setQrData(await makeQR(uri || hdr));
         } catch { setQrErr('Could not generate QR. Pay using the address below.'); }
 
-        // Begin blockchain polling
+        // Begin blockchain polling for THIS session's startedAt
         startPolling();
         return;
       }
@@ -476,77 +464,6 @@ export default function App() {
     }
   }
 
-  // ── "I Have Paid — Check Now" button ─────────────────────────────────────
-  // Step 1: check blockchain (30-min window). If paid → use those results.
-  // Step 2: if blockchain not confirmed yet, call /analyze-direct anyway.
-  // Step 3: surface ANY server error clearly instead of silent failure.
-  async function handleCheckNow() {
-    // Stop background polling
-    clearTimeout(timerRef.current);
-    timerRef.current = null;
-    stopRef.current = true;
-
-    setPhase('analyzing');
-    setModalError('');
-
-    try {
-      // ── Step 1: check blockchain ──────────────────────────────────────
-      const checkResp = await fetch(`${API_URL}/check-payment`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content:   contentRef.current,
-          startedAt: Date.now() - 30 * 60 * 1000,   // 30-min lookback
-          amount:    amountRef.current,
-        }),
-      });
-
-      if (checkResp.ok) {
-        const checkData = await checkResp.json();
-        if (checkData.paid === true && checkData.results) {
-          // ✅ Blockchain confirmed + AI results in one shot
-          setModalOpen(false);
-          setPhase('idle');
-          setResults(checkData.results);
-          return;
-        }
-      }
-
-      // ── Step 2: run AI directly (no payment gate) ─────────────────────
-      setPhase('analyzing');
-
-      const aiResp = await fetch(`${API_URL}/analyze-direct`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: contentRef.current }),
-      });
-
-      // Parse body regardless of status so we can show the error
-      let aiData = null;
-      try { aiData = await aiResp.json(); } catch {}
-
-      if (aiResp.ok && aiData?.results) {
-        // ✅ AI analysis returned successfully
-        setModalOpen(false);
-        setPhase('idle');
-        setResults(aiData.results);
-        return;
-      }
-
-      // ── Step 3: surface the real error ────────────────────────────────
-      const errMsg = aiData?.error
-        || (aiResp.status === 503 ? 'AI service not configured — set OPENAI_API_KEY in backend .env'
-          : aiResp.status === 429 ? 'AI rate limit reached — please wait a moment and try again'
-          : `Server error ${aiResp.status}`)
-      setModalError(errMsg);
-      setPhase('error');
-
-    } catch (err) {
-      setModalError(`Network error: ${err.message}`);
-      setPhase('error');
-    }
-  }
-
   // ── Modal close ───────────────────────────────────────────────────────────
   function handleCloseModal() {
     stopPolling();
@@ -557,11 +474,13 @@ export default function App() {
     setPhase('idle');
     setModalError('');
     setBusy(false);
+    // Don't clear verifiedTxRef — user might re-open and retry AI
   }
 
   // ── Reset ─────────────────────────────────────────────────────────────────
   function handleReset() {
     stopPolling();
+    sessionIdRef.current += 1;     // invalidate any in-flight polls
     setContent('');
     setResults(null);
     setError('');
@@ -693,7 +612,6 @@ export default function App() {
           modalError={modalError}
           onClose={handleCloseModal}
           onRetry={handleAnalyze}
-          onCheckNow={handleCheckNow}
         />
       )}
 
